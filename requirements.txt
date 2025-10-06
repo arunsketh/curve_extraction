@@ -1,6 +1,5 @@
 streamlit
-numpy
-matplotlib
-Pillow
-scikit-image
 pandas
+pillow
+plotdigitizer
+streamlit-image-coordinates
