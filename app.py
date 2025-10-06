@@ -5,142 +5,176 @@ from PIL import Image
 from skimage.measure import find_contours
 import pandas as pd
 import io
+from streamlit_image_coordinates import streamlit_image_coordinates
 
-def extract_curve_data(np_image, x_min, x_max, y_min, y_max):
+# --- Core Logic ---
+
+def scale_point(px, py, calibration_points):
     """
-    Core logic to extract curve data from a numpy image array.
+    Scales a single pixel coordinate to a data coordinate using the
+    4-point calibration data.
     """
-    # Convert to grayscale if the image is in color
+    # Pixel coordinates from calibration
+    p_x1, p_y1 = calibration_points['X1']['pixel']
+    p_x2, p_y2 = calibration_points['X2']['pixel']
+    p_x3, p_y3 = calibration_points['Y1']['pixel']
+    p_x4, p_y4 = calibration_points['Y2']['pixel']
+
+    # Data values from calibration
+    d_x1 = calibration_points['X1']['value']
+    d_x2 = calibration_points['X2']['value']
+    d_y1 = calibration_points['Y1']['value']
+    d_y2 = calibration_points['Y2']['value']
+
+    # Linear interpolation for X
+    # Assumes X-axis is mostly horizontal
+    data_x = d_x1 + (px - p_x1) * (d_x2 - d_x1) / (p_x2 - p_x1)
+    
+    # Linear interpolation for Y
+    # Assumes Y-axis is mostly vertical, and image y-coordinates increase downwards
+    data_y = d_y1 + (py - p_y3) * (d_y2 - d_y1) / (p_y4 - p_y3)
+
+    return data_x, data_y
+
+def extract_curve_data(np_image, calibration_points, threshold_value=127):
+    """
+    Extracts curve data from an image using scikit-image, then scales it
+    using the provided calibration points.
+    """
+    # 1. Image Preprocessing
     if len(np_image.shape) == 3 and np_image.shape[2] > 1:
-        # Handle RGBA images by slicing off the alpha channel
         gray = np.dot(np_image[...,:3], [0.2989, 0.5870, 0.1140])
     else:
         gray = np_image
-
-    # Apply a binary threshold (assumes dark curve on a light background)
-    # The threshold value (127) can be adjusted if needed.
-    binary = (gray <= 127).astype(np.uint8) * 255
     
-    # Find contours using scikit-image
+    binary = (gray <= threshold_value).astype(np.uint8) * 255
+    
+    # 2. Contour Detection
     contours = find_contours(binary, 128)
-    
     if not contours:
         return None, None
         
-    # Assume the longest contour is the curve of interest
     curve_contour = max(contours, key=len)
     
-    # Sort points by their x-coordinate (column 1)
-    # scikit-image returns coordinates as (row, col) which corresponds to (y, x)
-    sorted_points = curve_contour[curve_contour[:, 1].argsort()]
+    # 3. Scaling
+    # scikit-image returns (row, col) which is (y, x)
+    pixel_y_coords = curve_contour[:, 0]
+    pixel_x_coords = curve_contour[:, 1]
     
-    pixel_x = sorted_points[:, 1]
-    pixel_y = sorted_points[:, 0]
+    scaled_points = [scale_point(px, py, calibration_points) for px, py in zip(pixel_x_coords, pixel_y_coords)]
     
-    img_height, img_width = gray.shape[:2]
+    # 4. Sorting
+    scaled_points.sort() # Sort by x-value
     
-    # Scale pixel coordinates to data coordinates
-    extracted_x = x_min + (pixel_x / img_width) * (x_max - x_min)
-    # Invert y-axis scaling because image y=0 is at the top
-    extracted_y = y_max - (pixel_y / img_height) * (y_max - y_min)
+    extracted_x = np.array([p[0] for p in scaled_points])
+    extracted_y = np.array([p[1] for p in scaled_points])
     
     return extracted_x, extracted_y
 
-# --- Streamlit App Layout ---
+# --- Streamlit UI ---
 
 st.set_page_config(layout="wide")
-st.title("📈 Curve Data Extractor")
-st.write("Upload an image of a graph, define the axes, and extract the data points from the curve.")
+st.title("🔬 Web Plot Digitizer")
+st.write("A tool inspired by [WebPlotDigitizer](https://automeris.io/WebPlotDigitizer/) to extract data from graph images.")
 
-# --- Sidebar for Controls ---
-with st.sidebar:
+# --- Session State Initialization ---
+if 'calib' not in st.session_state:
+    st.session_state.calib = {
+        "X1": {"pixel": None, "value": 0.0},
+        "X2": {"pixel": None, "value": 1.0},
+        "Y1": {"pixel": None, "value": 0.0},
+        "Y2": {"pixel": None, "value": 1.0},
+    }
+if 'image' not in st.session_state:
+    st.session_state.image = None
+if 'extracted_data' not in st.session_state:
+    st.session_state.extracted_data = None
+
+# --- UI Layout ---
+col_main, col_sidebar = st.columns([3, 1])
+
+with col_sidebar:
     st.header("Controls")
-    uploaded_file = st.file_uploader("Choose a graph image", type=["png", "jpg", "jpeg", "bmp"])
-    
-    st.subheader("Define Axis Limits")
-    col1, col2 = st.columns(2)
-    with col1:
-        x_min = st.number_input("X Min", value=0.0, format="%.2f")
-        y_min = st.number_input("Y Min", value=0.0, format="%.2f")
-    with col2:
-        x_max = st.number_input("X Max", value=10.0, format="%.2f")
-        y_max = st.number_input("Y Max", value=100.0, format="%.2f")
+    uploaded_file = st.file_uploader("1. Upload Graph Image", type=["png", "jpg", "jpeg"])
 
-    extract_button = st.button("Extract Data", type="primary", use_container_width=True)
-
-# --- Main Area for Display ---
-col_img, col_plot = st.columns(2)
-
-with col_img:
-    st.subheader("Image Preview")
     if uploaded_file:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded Graph", use_column_width=True)
-    else:
-        st.info("Please upload an image using the sidebar control.")
+        st.session_state.image = Image.open(uploaded_file)
 
-with col_plot:
-    st.subheader("Extracted Data Plot")
-    # Use a placeholder for the plot area
-    plot_container = st.empty()
-    plot_container.info("The plot of the extracted data will appear here.")
-
-
-# --- Processing and Logic ---
-if extract_button and uploaded_file:
-    with st.spinner("Processing image..."):
-        try:
-            # Convert uploaded file to numpy array
-            pil_image = Image.open(uploaded_file)
-            np_image = np.array(pil_image)
-
-            # Perform data extraction
-            x_data, y_data = extract_curve_data(np_image, x_min, x_max, y_min, y_max)
-
-            if x_data is not None and y_data is not None:
-                st.session_state['x_data'] = x_data
-                st.session_state['y_data'] = y_data
-                
-                # Plot the results
-                fig, ax = plt.subplots()
-                ax.plot(x_data, y_data, 'r.-', label='Extracted Data')
-                ax.set_title("Extracted Data Preview")
-                ax.set_xlabel("X-Axis")
-                ax.set_ylabel("Y-Axis")
-                ax.grid(True)
-                ax.legend()
-                plot_container.pyplot(fig)
-                
-                st.toast(f"Successfully extracted {len(x_data)} data points!", icon="✅")
-                
-            else:
-                st.error("No curve could be found in the image. Please check the image contrast or ensure the curve is continuous.")
-                st.session_state['x_data'] = None
-                st.session_state['y_data'] = None
-
-        except Exception as e:
-            st.error(f"An error occurred during processing: {e}")
-            st.session_state['x_data'] = None
-            st.session_state['y_data'] = None
-
-# Add download button in the sidebar if data exists
-if 'x_data' in st.session_state and st.session_state['x_data'] is not None:
-    with st.sidebar:
-        st.subheader("Download Data")
-        df = pd.DataFrame({
-            'x_value': st.session_state['x_data'],
-            'y_value': st.session_state['y_data']
-        })
+    if st.session_state.image:
+        st.subheader("2. Calibrate Axes")
+        st.write("Select a point, enter its value, then click on the image.")
         
-        # Convert dataframe to CSV in memory
-        csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer, index=False)
-        csv_buffer.seek(0)
-
-        st.download_button(
-            label="Download as CSV",
-            data=csv_buffer.getvalue(),
-            file_name="extracted_data.csv",
-            mime="text/csv",
-            use_container_width=True
+        calib_point_select = st.radio(
+            "Select calibration point:",
+            ("X1", "X2", "Y1", "Y2"),
+            horizontal=True,
+            key="calib_select"
         )
+        
+        current_value = st.session_state.calib[calib_point_select]['value']
+        new_value = st.number_input(f"Value for {calib_point_select}", value=current_value, key=f"val_{calib_point_select}")
+        st.session_state.calib[calib_point_select]['value'] = new_value
+
+        st.info("Current Calibration:")
+        st.json(st.session_state.calib)
+        
+        is_calibrated = all(p['pixel'] is not None for p in st.session_state.calib.values())
+        
+        st.subheader("3. Extract Data")
+        threshold = st.slider("Threshold (for dark line detection)", 0, 255, 127)
+        if st.button("Extract Data", type="primary", disabled=not is_calibrated, use_container_width=True):
+            with st.spinner("Processing..."):
+                x, y = extract_curve_data(np.array(st.session_state.image), st.session_state.calib, threshold)
+                if x is not None:
+                    st.session_state.extracted_data = {"x": x, "y": y}
+                    st.toast(f"Extracted {len(x)} points!", icon="✅")
+                else:
+                    st.error("No curve found. Try adjusting the threshold.")
+                    st.session_state.extracted_data = None
+        
+        if st.session_state.extracted_data:
+            st.subheader("4. Download")
+            df = pd.DataFrame(st.session_state.extracted_data)
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="Download as CSV",
+                data=csv,
+                file_name="extracted_data.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+with col_main:
+    st.subheader("Image and Plot")
+    if st.session_state.image:
+        clicked_coords = streamlit_image_coordinates(st.session_state.image, key="image_coords")
+
+        if clicked_coords:
+            point_key = st.session_state.calib_select
+            st.session_state.calib[point_key]['pixel'] = (clicked_coords['x'], clicked_coords['y'])
+            # We use st.rerun() to immediately update the JSON display in the sidebar
+            st.rerun()
+
+        if st.session_state.extracted_data:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.imshow(st.session_state.image)
+            
+            # Convert scaled data back to pixel coordinates to overlay on image
+            calib = st.session_state.calib
+            p_x1, p_y1, d_x1, d_y1 = calib['X1']['pixel'][0], calib['Y1']['pixel'][1], calib['X1']['value'], calib['Y1']['value']
+            p_x2, p_y2, d_x2, d_y2 = calib['X2']['pixel'][0], calib['Y2']['pixel'][1], calib['X2']['value'], calib['Y2']['value']
+
+            plot_x = p_x1 + (st.session_state.extracted_data['x'] - d_x1) * (p_x2 - p_x1) / (d_x2 - d_x1)
+            plot_y = p_y1 + (st.session_state.extracted_data['y'] - d_y1) * (p_y2 - p_y1) / (d_y2 - d_y1)
+
+            ax.plot(plot_x, plot_y, 'r-', linewidth=2, label="Extracted Data")
+            ax.set_title("Extracted Data Overlay")
+            ax.axis('off')
+            ax.legend()
+            st.pyplot(fig)
+        else:
+            st.info("After calibrating all 4 points, the extraction result will be shown here.")
+            
+    else:
+        st.info("Upload an image to begin the process.")
+
